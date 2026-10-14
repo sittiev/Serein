@@ -1,5 +1,5 @@
 use crate::{
-	Controls, Frame, Status,
+	Controls, Frame, Status, StereoFrame,
 	crypto::{Dave, Encryption, Identity, MAX_PACKET, MAX_SIGNAL, MODE},
 	diagnostics::{Signal, Video},
 	video_receive::{
@@ -236,16 +236,17 @@ fn discovery(packet: &[u8], ssrc: u32) -> Result<(IpAddr, u16), &'static str> {
 }
 
 /// Drop the control sender or abort this future to stop the socket, UDP, codecs and ephemeral keys.
-/// PCM queues must contain at most eight 20ms mono48k frames each. No audio device opens here.
+/// Capture queues carry at most eight 20ms mono48k frames each; playback queues carry
+/// at most eight 20ms stereo48k frames each. No audio device opens here.
 #[allow(clippy::too_many_arguments)] // Every media input of one call.
 pub async fn run(
 	credentials: VoiceConnection,
 	capture: Receiver<Frame>,
-	playback: SyncSender<Frame>,
+	playback: SyncSender<StereoFrame>,
 	controls: watch::Receiver<Controls>,
 	camera: Option<Receiver<crate::camera_video::Frame>>,
 	remote_video: Option<VideoSink>,
-	stream_audio: Option<Receiver<Frame>>,
+	stream_audio: Option<Receiver<StereoFrame>>,
 	emit: impl Fn(Status) -> Result<(), ()> + Send + 'static,
 ) -> Result<(), &'static str> {
 	run_with_identity(
@@ -266,11 +267,11 @@ pub async fn run(
 pub async fn run_with_identity(
 	credentials: VoiceConnection,
 	capture: Receiver<Frame>,
-	playback: SyncSender<Frame>,
+	playback: SyncSender<StereoFrame>,
 	controls: watch::Receiver<Controls>,
 	camera: Option<Receiver<crate::camera_video::Frame>>,
 	remote_video: Option<VideoSink>,
-	stream_audio: Option<Receiver<Frame>>,
+	stream_audio: Option<Receiver<StereoFrame>>,
 	emit: impl Fn(Status) -> Result<(), ()> + Send + 'static,
 	identity: Arc<Identity>,
 ) -> Result<(), &'static str> {
@@ -296,11 +297,11 @@ pub async fn run_with_identity(
 async fn run_inner(
 	credentials: VoiceConnection,
 	capture: Receiver<Frame>,
-	playback: SyncSender<Frame>,
+	playback: SyncSender<StereoFrame>,
 	mut controls: watch::Receiver<Controls>,
 	camera: Option<Receiver<crate::camera_video::Frame>>,
 	remote_video: Option<VideoSink>,
-	stream_audio: Option<Receiver<Frame>>,
+	stream_audio: Option<Receiver<StereoFrame>>,
 	emit: impl Fn(Status) -> Result<(), ()>,
 	identity: Arc<Identity>,
 	url: String,
@@ -1061,7 +1062,7 @@ pub async fn watch_stream(
 	credentials: VoiceConnection,
 	identity: Arc<Identity>,
 	sink: VideoSink,
-	audio: Option<SyncSender<Frame>>,
+	audio: Option<SyncSender<StereoFrame>>,
 	emit: impl Fn(Status) -> Result<(), ()> + Send + 'static,
 ) -> Result<(), &'static str> {
 	let url = endpoint(&credentials.endpoint)?;
@@ -1085,7 +1086,7 @@ async fn run_stream_inner(
 	identity: Arc<Identity>,
 	mut video: Option<crate::screen::Video>,
 	sink: Option<VideoSink>,
-	audio: Option<SyncSender<Frame>>,
+	audio: Option<SyncSender<StereoFrame>>,
 	emit: impl Fn(Status) -> Result<(), ()>,
 	url: String,
 	local_test: bool,

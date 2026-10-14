@@ -1,19 +1,19 @@
 //! Keep the independent stream/call audio clocks from accumulating stale queued PCM.
-use crate::Frame;
+use crate::StereoFrame;
 use std::{collections::VecDeque, sync::mpsc::Receiver};
 
 #[derive(Default)]
 pub(crate) struct Playout {
-	pending: VecDeque<Frame>,
+	pending: VecDeque<StereoFrame>,
 }
 impl Playout {
 	pub fn next(
 		&mut self,
-		source: &Receiver<Frame>,
+		source: &Receiver<StereoFrame>,
 		volume: u16,
 		enabled: bool,
 		stalled: bool,
-	) -> Option<Frame> {
+	) -> Option<StereoFrame> {
 		// ponytail: bound clock drift by trimming PCM; sender-clock A/V sync needs RTCP timing.
 		// The source queue holds eight 20 ms frames. Retain at most two: absorb small
 		// scheduling bursts without playing the full backlog after a delayed tick.

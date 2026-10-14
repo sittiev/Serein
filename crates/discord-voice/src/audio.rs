@@ -1,7 +1,7 @@
 //! Device I/O starts only for an explicit call or a user-started local microphone preview.
 //! CPAL callbacks use preallocated lock-free rings; codecs and channels stay off them.
-use crate::Frame;
 use crate::diagnostics::{Metrics, Scope, Stage};
+use crate::{Frame, StereoFrame};
 mod echo;
 use model::voice_settings::{NoiseSuppression, Processing, VoiceProcessing};
 #[cfg(target_os = "macos")]
@@ -159,7 +159,7 @@ impl Audio {
 	pub fn start(
 		settings: Devices,
 		capture: mpsc::SyncSender<Frame>,
-		playback: mpsc::Receiver<Frame>,
+		playback: mpsc::Receiver<StereoFrame>,
 		emit: impl Fn(Result<(), &'static str>) + Send + 'static,
 	) -> Result<Self, &'static str> {
 		Self::start_inner(settings, capture, playback, emit, false)
@@ -182,7 +182,7 @@ impl Audio {
 	fn start_inner(
 		settings: Devices,
 		capture: mpsc::SyncSender<Frame>,
-		playback: mpsc::Receiver<Frame>,
+		playback: mpsc::Receiver<StereoFrame>,
 		emit: impl Fn(Result<(), &'static str>) + Send + 'static,
 		preview: bool,
 	) -> Result<Self, &'static str> {
@@ -406,7 +406,9 @@ impl Audio {
 									.input_gate
 									.apply(&mut frame, processing.sensitivity_db);
 								if preview {
-									drops += u64::from(active.output.push(frame).is_err());
+									// Local mic preview is mono; monitor it as dual-mono.
+									let stereo: StereoFrame = std::array::from_fn(|i| frame[i / 2]);
+									drops += u64::from(active.output.push(stereo).is_err());
 								} else if audible {
 									drops += u64::from(capture.try_send(frame).is_err());
 								}
@@ -549,7 +551,7 @@ struct Streams {
 	_input: Option<cpal::Stream>,
 	_output: cpal::Stream,
 	input: rtrb::Consumer<Frame>,
-	output: rtrb::Producer<Frame>,
+	output: rtrb::Producer<StereoFrame>,
 	reference: rtrb::Consumer<Frame>,
 	/// Devices actually opened, so a changed system default can be followed.
 	output_id: Option<String>,
@@ -981,12 +983,12 @@ impl Capture {
 }
 struct Playback {
 	media_generation: u64,
-	input: rtrb::Consumer<Frame>,
+	input: rtrb::Consumer<StereoFrame>,
 	reference: Capture,
-	frame: Frame,
+	frame: StereoFrame,
 	index: usize,
-	previous: f32,
-	next: f32,
+	previous: [f32; 2],
+	next: [f32; 2],
 	phase: f64,
 	step: f64,
 }
@@ -1011,25 +1013,39 @@ impl Playback {
 		} else {
 			let gain = f32::from(gate.output_gain.load(Ordering::Relaxed)) / 100.0;
 			for frame in data.chunks_mut(channels) {
-				let sample = amplify(self.sample(), gain);
-				frame.fill(T::from_sample(sample));
+				let [left, right] = self.sample().map(|sample| amplify(sample, gain));
+				let mono = (left + right) * 0.5;
+				for (channel, slot) in frame.iter_mut().enumerate() {
+					// Stereo feeds the first two channels; anything beyond that, like a
+					// mono device, hears the mono downmix. The echo reference below
+					// always uses the same downmix, keeping AEC on its mono path.
+					*slot = T::from_sample(match channel {
+						0 => left,
+						1 if channels > 1 => right,
+						_ => mono,
+					});
+				}
 				// Reference actual output, including gain, underrun silence and resampling.
-				self.reference.sample(sample);
+				self.reference.sample(mono);
 			}
 		}
 		if std::mem::take(&mut self.reference.overrun) {
 			gate.echo_reset.store(true, Ordering::Release);
 		}
 	}
-	fn new(rate: u32, input: rtrb::Consumer<Frame>, reference: rtrb::Producer<Frame>) -> Self {
+	fn new(
+		rate: u32,
+		input: rtrb::Consumer<StereoFrame>,
+		reference: rtrb::Producer<Frame>,
+	) -> Self {
 		Self {
 			media_generation: 0,
 			input,
 			reference: Capture::new(rate, reference),
-			frame: [0.0; 960],
+			frame: [0.0; 1_920],
 			index: 960,
-			previous: 0.0,
-			next: 0.0,
+			previous: [0.0; 2],
+			next: [0.0; 2],
 			phase: 1.0,
 			step: 48_000.0 / f64::from(rate),
 		}
@@ -1043,30 +1059,34 @@ impl Playback {
 		self.reference.reset();
 		self.frame.fill(0.0);
 		self.index = 960;
-		self.previous = 0.0;
-		self.next = 0.0;
+		self.previous = [0.0; 2];
+		self.next = [0.0; 2];
 		self.phase = 1.0;
 	}
-	fn pull(&mut self) -> f32 {
+	fn pull(&mut self) -> [f32; 2] {
 		if self.index == 960 {
-			self.frame = self.input.pop().unwrap_or([0.0; 960]);
+			self.frame = self.input.pop().unwrap_or([0.0; 1_920]);
 			self.index = 0;
 		}
-		let value = self.frame[self.index];
+		let pair = [self.frame[self.index * 2], self.frame[self.index * 2 + 1]];
 		self.index += 1;
-		if value.is_finite() {
-			value.clamp(-1.0, 1.0)
-		} else {
-			0.0
-		}
+		std::array::from_fn(|i| {
+			if pair[i].is_finite() {
+				pair[i].clamp(-1.0, 1.0)
+			} else {
+				0.0
+			}
+		})
 	}
-	fn sample(&mut self) -> f32 {
+	fn sample(&mut self) -> [f32; 2] {
 		while self.phase >= 1.0 {
 			self.previous = self.next;
 			self.next = self.pull();
 			self.phase -= 1.0;
 		}
-		let value = self.previous + (self.next - self.previous) * self.phase as f32;
+		let value = std::array::from_fn(|i| {
+			self.previous[i] + (self.next[i] - self.previous[i]) * self.phase as f32
+		});
 		self.phase += self.step;
 		value
 	}
@@ -1336,7 +1356,7 @@ mod tests {
 					expected
 				);
 				let (mut send, receive) = rtrb::RingBuffer::new(8);
-				send.push([sample; 960]).unwrap();
+				send.push([sample; 1_920]).unwrap();
 				let mut playback = Playback::new(48_000, receive, rtrb::RingBuffer::new(8).0);
 				let mut rendered = [0.0_f32; 1920];
 				playback.render(&mut rendered, 2, &audio.gate);
@@ -1350,7 +1370,7 @@ mod tests {
 			capture.process(&[invalid; 961], 1, &audio.gate);
 			assert_eq!(receive.pop().unwrap(), [0.0; 960]);
 			let (mut send, receive) = rtrb::RingBuffer::new(8);
-			send.push([invalid; 960]).unwrap();
+			send.push([invalid; 1_920]).unwrap();
 			let mut playback = Playback::new(48_000, receive, rtrb::RingBuffer::new(8).0);
 			let mut rendered = [1.0_f32; 960];
 			playback.render(&mut rendered, 1, &audio.gate);
@@ -1366,7 +1386,7 @@ mod tests {
 		let (mut playback_send, playback_receive) = rtrb::RingBuffer::new(8);
 		let mut playback = Playback::new(48_000, playback_receive, rtrb::RingBuffer::new(8).0);
 		let mut rendered = [1.0_f32; 2];
-		playback_send.push([0.25; 960]).unwrap();
+		playback_send.push([0.25; 1_920]).unwrap();
 		capture.process(&[0.25; 961], 1, &audio.gate);
 		playback.render(&mut rendered, 1, &audio.gate);
 		assert!(captured.pop().is_err());
@@ -1382,7 +1402,7 @@ mod tests {
 
 		// The same callback state observes new controls; no stream needs recreation.
 		playback.reset();
-		playback_send.push([0.25; 960]).unwrap();
+		playback_send.push([0.25; 1_920]).unwrap();
 		playback.render(&mut rendered, 1, &audio.gate);
 		assert_eq!(rendered, [0.0, 0.25]);
 		audio.set_gain(200, 0);
@@ -1404,7 +1424,7 @@ mod tests {
 		// Muting the microphone never drops what you are hearing.
 		assert_eq!(rendered, [0.5; 2]);
 		audio.set_controls(false, true);
-		playback_send.push([0.75; 960]).unwrap();
+		playback_send.push([0.75; 1_920]).unwrap();
 		capture.process(&[0.75; 961], 1, &audio.gate);
 		playback.render(&mut rendered, 1, &audio.gate);
 		assert!(captured.pop().is_err());
@@ -1417,7 +1437,7 @@ mod tests {
 		assert_eq!(rendered, [0.0; 2]);
 		audio.gate.stopped.store(true, Ordering::Release);
 		capture.process(&[0.75; 961], 1, &audio.gate);
-		playback_send.push([0.75; 960]).unwrap();
+		playback_send.push([0.75; 1_920]).unwrap();
 		playback.render(&mut rendered, 1, &audio.gate);
 		assert!(captured.pop().is_err());
 		assert_eq!(rendered, [0.0; 2]);
@@ -1450,15 +1470,15 @@ mod tests {
 		}
 		let (mut send, receive) = rtrb::RingBuffer::new(8);
 		for _ in 0..8 {
-			send.push([0.5; 960]).unwrap();
+			send.push([0.5; 1_920]).unwrap();
 		}
-		assert!(send.push([0.5; 960]).is_err());
+		assert!(send.push([0.5; 1_920]).is_err());
 		let mut playback = Playback::new(44_100, receive, rtrb::RingBuffer::new(8).0);
 		for _ in 0..7000 {
-			assert!(playback.sample().is_finite());
+			assert!(playback.sample().iter().all(|s| s.is_finite()));
 		}
 		playback.reset();
-		assert_eq!(playback.sample(), 0.0);
+		assert_eq!(playback.sample(), [0.0; 2]);
 	}
 
 	#[test]

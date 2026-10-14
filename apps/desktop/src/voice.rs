@@ -175,7 +175,7 @@ struct Live {
 	/// Latest decoded camera picture per remote user, replaced (never queued) by the decoder.
 	remote_video: Arc<std::sync::Mutex<RemotePictures>>,
 	/// Decoded audio of a watched stream, mixed into this call's playback.
-	stream_audio: mpsc::SyncSender<discord_voice::Frame>,
+	stream_audio: mpsc::SyncSender<discord_voice::StereoFrame>,
 }
 
 #[derive(Default)]

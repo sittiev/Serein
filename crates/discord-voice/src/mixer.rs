@@ -1,5 +1,5 @@
 //! One bounded decoder and reorder window per authenticated remote speaker.
-use crate::{Frame, crypto::MAX_PARTICIPANTS, jitter::Jitter};
+use crate::{StereoFrame, crypto::MAX_PARTICIPANTS, jitter::Jitter};
 use opus2::{Channels, Decoder};
 
 struct Speaker {
@@ -7,7 +7,7 @@ struct Speaker {
 	ssrc: u32,
 	decoder: Decoder,
 	jitter: Jitter,
-	pcm: Box<[f32; 5760]>,
+	pcm: Box<[f32; 11_520]>,
 	offset: usize,
 	length: usize,
 	activity: u8,
@@ -39,10 +39,10 @@ impl Mixer {
 		self.speakers.push(Speaker {
 			user,
 			ssrc,
-			decoder: Decoder::new(48_000, Channels::Mono)
+			decoder: Decoder::new(48_000, Channels::Stereo)
 				.map_err(|_| "Opus decoder initialization failed")?,
 			jitter: Jitter::default(),
-			pcm: Box::new([0.0; 5760]),
+			pcm: Box::new([0.0; 11_520]),
 			offset: 0,
 			length: 0,
 			activity: 0,
@@ -78,12 +78,12 @@ impl Mixer {
 			.filter(|s| s.activity > 0)
 			.map(|s| s.user)
 	}
-	/// Mix one 20ms frame, preserving up to 120ms packets without bursting playback queues.
-	pub fn pop(&mut self) -> (Option<Frame>, bool) {
+	/// Mix one 20ms stereo frame, preserving up to 120ms packets without bursting playback queues.
+	pub fn pop(&mut self) -> (Option<StereoFrame>, bool) {
 		self.pop_with_volumes(&[])
 	}
-	pub fn pop_with_volumes(&mut self, volumes: &[(u64, u16)]) -> (Option<Frame>, bool) {
-		let mut output = [0.0; 960];
+	pub fn pop_with_volumes(&mut self, volumes: &[(u64, u16)]) -> (Option<StereoFrame>, bool) {
+		let mut output = [0.0; 1_920];
 		let mut active = false;
 		let mut heard = false;
 		for speaker in &mut self.speakers {
@@ -109,11 +109,13 @@ impl Mixer {
 					decoded += 1;
 					let limit = if opus.is_empty() {
 						// Preserve the lost packet duration; long concealment drains over 20ms ticks.
+						// The decoder reports per-channel duration; stereo needs both channels.
 						speaker
 							.decoder
 							.get_last_packet_duration()
 							.unwrap_or(960)
 							.clamp(120, 5760) as usize
+							* 2
 					} else {
 						speaker.pcm.len()
 					};
@@ -125,7 +127,8 @@ impl Mixer {
 						continue;
 					};
 					speaker.offset = 0;
-					speaker.length = length;
+					// The decoder reports per-channel duration; the stereo buffer holds both.
+					speaker.length = length * 2;
 					heard |= !opus.is_empty() && opus != davey::OPUS_SILENCE_PACKET;
 				}
 				let count = (output.len() - filled).min(speaker.length - speaker.offset);
@@ -142,7 +145,9 @@ impl Mixer {
 				filled += count;
 				active |= count != 0;
 			}
-			speaker.activity = crate::activity::hold(energy, speaker.activity);
+			// The activity gate is calibrated for mono energy; halve the stereo sum so a
+			// dual-mono speaker trips it exactly as before and true stereo averages out.
+			speaker.activity = crate::activity::hold(energy * 0.5, speaker.activity);
 		}
 		// ponytail: hard limiting bounds simultaneous speakers; add a soft limiter if clipping is audible.
 		output
@@ -155,6 +160,7 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Frame;
 	use opus2::{Application, Encoder};
 	fn opus(frequency: f32) -> Vec<u8> {
 		let mut encoder = Encoder::new(48_000, Channels::Mono, Application::Voip).unwrap();
@@ -188,7 +194,7 @@ mod tests {
 		let b = bob.pop().0.unwrap();
 		assert!(a.iter().any(|s| s.abs() > 0.01));
 		assert!(b.iter().any(|s| s.abs() > 0.01));
-		for i in 0..960 {
+		for i in 0..1_920 {
 			assert!((mixed[i] - (a[i] + b[i]).clamp(-1.0, 1.0)).abs() < 0.0001);
 		}
 		together.remove(1);
@@ -217,7 +223,7 @@ mod tests {
 				for speaker in &mut mixer.speakers {
 					speaker.pcm.fill(speaker.user as f32 * 0.1);
 					speaker.offset = 0;
-					speaker.length = 960;
+					speaker.length = 1_920;
 				}
 				let frame = mixer.pop_with_volumes(&volumes).0.unwrap();
 				assert!(
@@ -230,6 +236,7 @@ mod tests {
 			for speaker in &mut mixer.speakers {
 				speaker.pcm.fill(0.8);
 				speaker.offset = 0;
+				speaker.length = 1_920;
 			}
 			assert!(
 				mixer
@@ -246,8 +253,8 @@ mod tests {
 		for samples in [120, 240, 480, 960, 2880] {
 			let mut mixer = Mixer::default();
 			mixer.announce(1, 11).unwrap();
-			let mut encoder = Encoder::new(48_000, Channels::Mono, Application::Audio).unwrap();
-			let mut reference = Decoder::new(48_000, Channels::Mono).unwrap();
+			let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio).unwrap();
+			let mut reference = Decoder::new(48_000, Channels::Stereo).unwrap();
 			let mut expected = std::collections::VecDeque::new();
 			let mut sequence = 0;
 			let mut played = 0;
@@ -259,18 +266,21 @@ mod tests {
 					usize::from(tick % 3 == 0)
 				};
 				for _ in 0..packets {
+					// Dual-mono stereo packets: legacy mono senders decode the same way.
 					let pcm: Vec<_> = (0..samples)
-						.map(|index| {
-							((usize::from(sequence) * samples + index) as f32 * 0.037).sin() * 0.2
+						.flat_map(|index| {
+							let sample = ((usize::from(sequence) * samples + index) as f32 * 0.037)
+								.sin() * 0.2;
+							[sample, sample]
 						})
 						.collect();
 					let mut encoded = [0; 1275];
 					let len = encoder.encode_float(&pcm, &mut encoded).unwrap();
 					let packet = &encoded[..len];
-					let mut decoded = [0.0; 5760];
+					let mut decoded = [0.0; 11_520];
 					let length = reference.decode_float(packet, &mut decoded, false).unwrap();
 					assert_eq!(length, samples);
-					expected.extend(decoded[..length].iter().copied());
+					expected.extend(decoded[..length * 2].iter().copied());
 					mixer.push(11, sequence, packet.to_vec());
 					sequence = sequence.wrapping_add(1);
 				}
@@ -299,14 +309,17 @@ mod tests {
 		for samples in [240, 2880, 5760] {
 			let mut mixer = Mixer::default();
 			mixer.announce(1, 11).unwrap();
-			let mut encoder = Encoder::new(48_000, Channels::Mono, Application::Audio).unwrap();
+			let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio).unwrap();
 			encoder.set_bitrate(opus2::Bitrate::Bits(32_000)).unwrap();
-			let mut reference = Decoder::new(48_000, Channels::Mono).unwrap();
+			let mut reference = Decoder::new(48_000, Channels::Stereo).unwrap();
 			let mut expected = Vec::new();
 			for sequence in 0..4 {
 				let mut encoded = [0; 1275];
 				let input: Vec<f32> = (0..samples.min(2880))
-					.map(|i| (i as f32 * 0.037).sin() * 0.2)
+					.flat_map(|i| {
+						let sample = (i as f32 * 0.037).sin() * 0.2;
+						[sample, sample]
+					})
 					.collect();
 				let mut len = encoder.encode_float(&input, &mut encoded).unwrap();
 				if samples == 5760 {
@@ -317,7 +330,7 @@ mod tests {
 						.combine(&[&packet, &packet], &mut encoded)
 						.unwrap();
 				}
-				let mut decoded = vec![0.0; samples];
+				let mut decoded = vec![0.0; samples * 2];
 				let packet = if sequence == 1 {
 					&[][..]
 				} else {
@@ -334,7 +347,7 @@ mod tests {
 			}
 			assert!(mixer.pop().0.is_none());
 			assert!(mixer.pop().0.is_none());
-			for expected in expected.as_chunks::<960>().0 {
+			for expected in expected.as_chunks::<1_920>().0 {
 				let frame = mixer.pop().0.expect("one 20ms frame per playout tick");
 				for (actual, expected) in frame.iter().zip(expected) {
 					assert!(

@@ -51,7 +51,7 @@ struct Pending {
 	peer: Option<Id>,
 	session: Zeroizing<String>,
 	identity: Arc<Identity>,
-	audio: Option<std::sync::mpsc::SyncSender<discord_voice::Frame>>,
+	audio: Option<std::sync::mpsc::SyncSender<discord_voice::StereoFrame>>,
 	rtc: Option<(Id, Id)>,
 	server: Option<(voice::Secret, String)>,
 	started: Instant,
@@ -156,7 +156,7 @@ impl Watch {
 		ui: &mut ui::MessagingUi,
 		ctx: &egui::Context,
 		call: Option<super::screen::Call<'_>>,
-		audio: Option<std::sync::mpsc::SyncSender<discord_voice::Frame>>,
+		audio: Option<std::sync::mpsc::SyncSender<discord_voice::StereoFrame>>,
 	) -> Option<Command> {
 		let wanted = state.voice.active.as_ref().and_then(|active| {
 			let streamer = active.watching?;

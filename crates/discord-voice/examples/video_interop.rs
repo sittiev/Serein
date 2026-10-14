@@ -14,6 +14,7 @@ mod video;
 #[path = "../src/video_sps.rs"]
 mod video_sps;
 type Frame = [f32; 960];
+type StereoFrame = [f32; 1_920];
 
 fn main() {
 	// Synthetic Baseline SPS: 320x240, one reference picture, POC type 2.

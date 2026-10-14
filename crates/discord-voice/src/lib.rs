@@ -24,6 +24,8 @@ pub use video_receive::{RemoteFrame, VideoSink};
 pub mod camera_video;
 
 pub type Frame = [f32; 960];
+/// Interleaved 48 kHz stereo `f32` for one 20 ms playback frame (960 pairs).
+pub type StereoFrame = [f32; 1_920];
 #[derive(Clone, Copy)]
 pub struct Controls {
 	pub muted: bool,

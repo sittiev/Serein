@@ -6,6 +6,7 @@ mod stream_playout;
 #[path = "../src/video_receive.rs"]
 pub(crate) mod video_receive;
 type Frame = [f32; 960];
+type StereoFrame = [f32; 1_920];
 
 pub(crate) fn main() {
 	for fps in [15, 30, 60] {
@@ -26,18 +27,27 @@ pub(crate) fn main() {
 	let (send, receive) = std::sync::mpsc::sync_channel(8);
 	let mut audio = stream_playout::Playout::default();
 	for n in 1..=8 {
-		send.try_send([n as f32 / 10.0; 960]).unwrap();
+		send.try_send([n as f32 / 10.0; 1_920]).unwrap();
 	}
-	assert_eq!(audio.next(&receive, 50, true, false).unwrap(), [0.35; 960]);
-	assert_eq!(audio.next(&receive, 200, true, false).unwrap(), [1.0; 960]);
+	assert_eq!(
+		audio.next(&receive, 50, true, false).unwrap(),
+		[0.35; 1_920]
+	);
+	assert_eq!(
+		audio.next(&receive, 200, true, false).unwrap(),
+		[1.0; 1_920]
+	);
 	assert!(audio.next(&receive, 100, true, false).is_none());
 	for (volume, enabled, stalled) in [(0, true, false), (100, false, false), (100, true, true)] {
-		send.try_send([0.5; 960]).unwrap();
+		send.try_send([0.5; 1_920]).unwrap();
 		assert!(audio.next(&receive, volume, enabled, stalled).is_none());
 		assert!(audio.next(&receive, 100, true, false).is_none());
 	}
-	send.try_send([f32::NAN; 960]).unwrap();
-	assert_eq!(audio.next(&receive, 100, true, false).unwrap(), [0.0; 960]);
+	send.try_send([f32::NAN; 1_920]).unwrap();
+	assert_eq!(
+		audio.next(&receive, 100, true, false).unwrap(),
+		[0.0; 1_920]
+	);
 
 	let mut video = video_receive::Receivers::default();
 	video.announce(1, 100).unwrap();
