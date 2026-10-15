@@ -110,16 +110,30 @@ impl Calls {
 	pub(super) fn has_call(&self) -> bool {
 		self.active.is_some() || self.departing.is_some()
 	}
+	/// Why a Join packet was rejected, for the user-facing failure.
+	pub(super) fn join_rejection(&self) -> &'static str {
+		if self.departing.is_some() {
+			"The previous call is still leaving; the new call starts once it finishes"
+		} else if self.active.is_some() {
+			"Another call is already active on this device"
+		} else {
+			"This channel is unavailable for calling right now"
+		}
+	}
 
 	pub(super) fn departure_expired(&mut self) -> Option<Event> {
 		self.departure_deadline = None;
-		self.departing.map(|(channel, request)| {
-			Event::Voice(voice::Event::Failed {
-				channel,
-				request,
-				message: "Discord did not acknowledge hangup; reconnect before calling again",
-			})
-		})
+		// The call is over locally whether or not Discord acknowledged the hangup. Keeping
+		// the departure would wedge every later Join behind "still leaving" until the socket
+		// drops, so release it here and let the event tell the caller it went unacknowledged.
+		let (channel, request) = self.departing.take()?;
+		self.departing_session = None;
+		self.departing_guild = None;
+		Some(Event::Voice(voice::Event::Failed {
+			channel,
+			request,
+			message: "Discord did not acknowledge hangup; the call was left locally",
+		}))
 	}
 	pub(super) fn remember_users(&mut self, users: Vec<UserDto>) {
 		self.users.clear();
@@ -342,6 +356,26 @@ impl Calls {
 			Command::Leave { channel, request } => {
 				if self.active != Some((channel, request)) {
 					return Ok(None);
+				}
+				// A join Discord never admitted (no voice server credentials and no own
+				// session echo) has no service hangup to wait for: the leave packet still
+				// goes out in case the admission is in flight, but the call releases
+				// locally instead of waiting for an acknowledgement that cannot arrive.
+				if !self.session_confirmed
+					&& self.active_session.is_none()
+					&& self.negotiation_server.is_none()
+				{
+					let guild = self.active_guild;
+					self.active = None;
+					self.active_guild = None;
+					self.active_session = None;
+					self.negotiation_server = None;
+					self.stream = None;
+					self.watch = None;
+					self.camera = false;
+					self.muted = true;
+					self.deafened = true;
+					return Ok(Some(self.state_frame(None, guild)));
 				}
 				self.departing = self.active.take();
 				self.departing_session = self
@@ -1417,6 +1451,10 @@ mod tests {
 					.is_err()
 			);
 			assert!(calls.departure_expired().is_some());
+			// An unacknowledged hangup reports the failure and releases the departure, so
+			// the next Join is accepted here instead of wedging the voice controls until
+			// the gateway socket drops.
+			assert!(calls.departing.is_none() && calls.departure_deadline.is_none());
 			assert!(
 				calls
 					.packet(Command::Join {
@@ -1426,7 +1464,7 @@ mod tests {
 						mute: false,
 						deaf: false,
 					})
-					.is_err()
+					.is_ok()
 			);
 			calls
 				.dispatch(
@@ -1436,15 +1474,9 @@ mod tests {
 					&emit,
 				)
 				.unwrap();
+			// The late echo only updates the roster; it never reopens or retags the call.
 			assert!(calls.departing.is_none());
 			assert_eq!(events.lock().unwrap().len(), 4);
-			assert!(matches!(
-				events.lock().unwrap().last(),
-				Some(Event::Voice(voice::Event::Departed {
-					channel: Id(2),
-					request: 7
-				}))
-			)); // never retagged to request 8
 			calls
 				.packet(Command::Join {
 					channel: Id(2),
@@ -1457,6 +1489,171 @@ mod tests {
 			calls.dispatch("VOICE_STATE_UPDATE",br#"{"guild_id":"9","channel_id":"10","user_id":"1","session_id":"synthetic-session"}"#,Some(Id(1)),&emit).unwrap();
 			assert!(calls.active.is_none());
 		}
+	}
+	#[test]
+	fn leaving_a_join_discord_never_admitted_releases_locally() {
+		let mut calls = Calls::default();
+		calls.allowed.insert(Id(20), Some(Id(10)));
+		let join = |request| Command::Join {
+			channel: Id(20),
+			request,
+			ring: false,
+			mute: false,
+			deaf: false,
+		};
+		// The join packet is sent, but Discord refuses it (for example a full channel):
+		// no own session echo and no voice server credentials ever arrive.
+		assert!(calls.packet(join(5)).unwrap().is_some());
+		// Leaving sends the leave packet but releases the attempt locally instead of
+		// waiting for a hangup acknowledgement that cannot come.
+		assert!(
+			calls
+				.packet(Command::Leave {
+					channel: Id(20),
+					request: 5
+				})
+				.unwrap()
+				.is_some()
+		);
+		assert!(calls.active.is_none());
+		assert!(
+			!calls.has_call() && calls.departing.is_none() && calls.departure_deadline.is_none()
+		);
+		// The next Join is accepted immediately.
+		assert!(calls.packet(join(6)).unwrap().is_some());
+	}
+	#[test]
+	fn an_expired_departure_unblocks_the_next_join() {
+		let mut calls = Calls::default();
+		calls.allowed.insert(Id(20), Some(Id(10)));
+		let events = Mutex::new(Vec::new());
+		let emit = |event| {
+			events.lock().unwrap().push(event);
+			Ok(())
+		};
+		let join = |request| Command::Join {
+			channel: Id(20),
+			request,
+			ring: false,
+			mute: false,
+			deaf: false,
+		};
+		calls.packet(join(5)).unwrap();
+		// Admit the join the way the service does: own session echo plus voice server.
+		calls
+			.dispatch(
+				"VOICE_STATE_UPDATE",
+				br#"{"guild_id":"10","channel_id":"20","user_id":"1","session_id":"synthetic-session"}"#,
+				Some(Id(1)),
+				&emit,
+			)
+			.unwrap();
+		calls
+			.dispatch(
+				"VOICE_SERVER_UPDATE",
+				br#"{"guild_id":"10","channel_id":"20","token":"synthetic-token","endpoint":"synthetic.discord.media"}"#,
+				Some(Id(1)),
+				&emit,
+			)
+			.unwrap();
+		assert!(
+			calls
+				.packet(Command::Leave {
+					channel: Id(20),
+					request: 5
+				})
+				.unwrap()
+				.is_some()
+		);
+		assert!(calls.departing.is_some());
+		// A Join while the hangup is pending is still rejected...
+		assert!(calls.packet(join(6)).is_err());
+		// ...but the unacknowledged deadline releases it instead of wedging the controls.
+		assert!(matches!(
+			calls.departure_expired(),
+			Some(Event::Voice(voice::Event::Failed {
+				channel: Id(20),
+				request: 5,
+				message
+			})) if message == "Discord did not acknowledge hangup; the call was left locally"
+		));
+		assert!(
+			!calls.has_call() && calls.departing.is_none() && calls.departure_deadline.is_none()
+		);
+		assert!(calls.packet(join(6)).unwrap().is_some());
+	}
+	#[test]
+	fn join_rejections_name_the_pending_departure_or_the_active_call() {
+		let mut calls = Calls::default();
+		calls.allowed.insert(Id(20), Some(Id(10)));
+		let join = |request| Command::Join {
+			channel: Id(20),
+			request,
+			ring: false,
+			mute: false,
+			deaf: false,
+		};
+		assert_eq!(
+			calls.join_rejection(),
+			"This channel is unavailable for calling right now"
+		);
+		calls.packet(join(1)).unwrap();
+		assert_eq!(
+			calls.join_rejection(),
+			"Another call is already active on this device"
+		);
+		// A join the service never admitted releases locally, so nothing blocks the next one.
+		assert!(
+			calls
+				.packet(Command::Leave {
+					channel: Id(20),
+					request: 1
+				})
+				.unwrap()
+				.is_some()
+		);
+		assert!(!calls.has_call());
+		assert_eq!(
+			calls.join_rejection(),
+			"This channel is unavailable for calling right now"
+		);
+		// An admitted leave arms the departure until the acknowledgement or its deadline.
+		calls.packet(join(2)).unwrap();
+		let events = Mutex::new(Vec::new());
+		let emit = |event| {
+			events.lock().unwrap().push(event);
+			Ok(())
+		};
+		calls
+			.dispatch(
+				"VOICE_STATE_UPDATE",
+				br#"{"guild_id":"10","channel_id":"20","user_id":"1","session_id":"synthetic-session"}"#,
+				Some(Id(1)),
+				&emit,
+			)
+			.unwrap();
+		calls
+			.dispatch(
+				"VOICE_SERVER_UPDATE",
+				br#"{"guild_id":"10","channel_id":"20","token":"synthetic-token","endpoint":"synthetic.discord.media"}"#,
+				Some(Id(1)),
+				&emit,
+			)
+			.unwrap();
+		assert!(
+			calls
+				.packet(Command::Leave {
+					channel: Id(20),
+					request: 2
+				})
+				.unwrap()
+				.is_some()
+		);
+		assert!(calls.departing.is_some());
+		assert_eq!(
+			calls.join_rejection(),
+			"The previous call is still leaving; the new call starts once it finishes"
+		);
 	}
 	#[test]
 	fn camera_controls_preserve_mute_and_reject_stale_or_revoked_enable() {
