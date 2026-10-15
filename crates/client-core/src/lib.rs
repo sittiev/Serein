@@ -53,6 +53,7 @@ pub mod voice;
 use model::*;
 use session_cache::Timeline;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 use trail::Place;
 
 pub const MAX_DRAFT_BYTES: usize = 2 * 1024 * 1024;
@@ -67,6 +68,12 @@ pub const MAX_MEMBER_PRESENCE_BYTES: usize = 128 * 1024;
 pub const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 pub const EVENT_SLOTS: usize = 8; // UI drain batch; reliable events share a 32 MiB byte budget.
 pub const COMMAND_SLOTS: usize = 16; // ordinary commands <=16 KiB; bulk DM settings <=33 KiB; channel edit <=128 KiB; group icon <=350 KiB
+/// Discord rejects some message-history reads of ordinary sessions (for example a Missing
+/// Access answer while login synchronization settles) without the local permission state
+/// changing. Such a response retries a bounded number of times before the channel is
+/// revoked; a response corroborated by local permissions still revokes immediately.
+const MAX_HISTORY_RETRIES: u8 = 2;
+const HISTORY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub enum Command {
 	Polls(polls::Request),
@@ -789,6 +796,16 @@ pub struct State {
 	pub newer_cursor: Option<Id>,
 	pub newer_may_have_more: bool,
 	pub history_pending: bool,
+	/// Bounded rejected-read retries spent for the current history request.
+	#[doc(hidden)]
+	pub history_retry: u8,
+	/// When the next rejected-read retry fires.
+	#[doc(hidden)]
+	pub history_retry_at: Option<Instant>,
+	/// A channel whose open was rejected while its permissions were still unknown;
+	/// opened again automatically once they arrive. Cleared by a new session.
+	#[doc(hidden)]
+	pub permission_blocked: Option<Id>,
 	pub older_exhausted: bool,
 	pub gateway_connected: bool,
 	pub revision: u64,
@@ -994,6 +1011,9 @@ impl Default for State {
 			newer_cursor: None,
 			newer_may_have_more: false,
 			history_pending: false,
+			history_retry: 0,
+			history_retry_at: None,
+			permission_blocked: None,
 			older_exhausted: false,
 			gateway_connected: false,
 			revision: 0,
@@ -1259,6 +1279,9 @@ impl State {
 			return Apply::Rejected("This channel kind is unsupported");
 		}
 		if !self.can_view(channel) {
+			// Login synchronization can answer a click before the guild's permission
+			// data arrives; remember it so the permissions can open it for the user.
+			self.permission_blocked = Some(channel);
 			return Apply::Rejected("Channel permissions are unavailable or access was revoked");
 		}
 		if let Some(previous) = self.selected {
@@ -1283,6 +1306,10 @@ impl State {
 		}
 		self.member_search = Default::default();
 		self.selected = Some(channel);
+		// A new selection starts a fresh rejected-read retry budget.
+		self.history_retry = 0;
+		self.history_retry_at = None;
+		self.permission_blocked = None;
 		self.clear_search();
 		self.reset_thread_starter();
 		self.search_target = None;
@@ -1375,6 +1402,9 @@ impl State {
 		self.history_navigation.clear();
 		self.search_target = None;
 		self.restore_scroll = false;
+		self.history_retry = 0;
+		self.history_retry_at = None;
+		self.permission_blocked = None;
 		self.record(Place::Home);
 	}
 
@@ -1756,6 +1786,53 @@ impl State {
 		}
 		let before = self.timeline.row_ids().next()?;
 		Some(self.history(Some(before)))
+	}
+	/// When a bounded rejected-read retry fires; the UI schedules a repaint for it.
+	pub fn history_retry_in(&self) -> Option<Duration> {
+		self.history_retry_at
+			.map(|at| at.saturating_duration_since(Instant::now()))
+	}
+	/// Re-issues the selected channel's history after a read Discord rejected while the
+	/// local permission state still allowed it; `None` until the retry delay passes.
+	pub fn retry_history(&mut self) -> Option<Command> {
+		let at = self.history_retry_at?;
+		if Instant::now() < at {
+			return None;
+		}
+		self.history_retry_at = None;
+		Some(self.history_range(None, None))
+	}
+	/// Opens the channel whose open was rejected while its permissions were still unknown;
+	/// `None` until they arrive, and never one that access genuinely denies.
+	pub fn retry_blocked_channel(&mut self) -> Option<Command> {
+		let channel = self.permission_blocked?;
+		if !self.can_read_history(channel) {
+			return None;
+		}
+		self.permission_blocked = None;
+		self.select(channel)
+	}
+	/// Permissions that arrive after the conversation was marked unavailable — a guild whose
+	/// data syncs after login, for example — re-request its history. `None` while a request
+	/// is outstanding, while the gateway is down, or while access is still denied.
+	pub fn refresh_unavailable_history(&mut self) -> Option<Command> {
+		if self.history_pending
+			|| !self.gateway_connected
+			|| self.history_retry >= MAX_HISTORY_RETRIES
+			|| self.freshness != Freshness::Unavailable
+		{
+			return None;
+		}
+		let channel = self.selected?;
+		if !self.can_read_history(channel)
+			|| !self
+				.channels
+				.iter()
+				.any(|loaded| loaded.id == channel && loaded.supports_text())
+		{
+			return None;
+		}
+		Some(self.history_range(None, None))
 	}
 	pub fn prepare_send(&mut self) -> Option<Command> {
 		self.prepare_send_with_attachment(None)
@@ -2301,6 +2378,12 @@ impl State {
 						self.status = "Camera control was not sent; camera is off locally";
 					}
 				}
+				voice::Command::Leave { .. } | voice::Command::AbandonSession { .. } => {
+					// The hangup never left this device, so no service departure is pending
+					// and a new call does not have to wait for one.
+					self.voice.departing = None;
+					self.status = "Call control was not sent; local mute/hangup still applies";
+				}
 				_ => self.status = "Call control was not sent; local mute/hangup still applies",
 			}
 			return;
@@ -2409,6 +2492,11 @@ impl State {
 		if matches!(envelope.event, Event::Ready { .. } | Event::Resync) {
 			self.startup_warnings = Default::default();
 			self.failure_detail = None;
+			// A new session answers clicks with fresh permission data.
+			self.permission_blocked = None;
+			// Voice state is re-established by the new session.
+			self.voice.departing = None;
+			self.voice.pending_join = None;
 		}
 		if matches!(envelope.event, Event::Resync) {
 			self.read_state.reset();
@@ -3391,6 +3479,9 @@ impl State {
 				}
 				if r.is_ok() {
 					self.finish_history_navigation(channel, request);
+					// A delivered page proves reads work again; start a fresh retry budget.
+					self.history_retry = 0;
+					self.history_retry_at = None;
 					self.freshness = if self.gateway_connected {
 						Freshness::Fresh
 					} else {
@@ -3411,6 +3502,18 @@ impl State {
 					return;
 				}
 				self.cancel_history();
+				// A Forbidden read the local permission state still allows is a service-side
+				// rejection (ordinary sessions see them while login settles), not lost
+				// access: retry a bounded number of times before revoking the channel.
+				if failure == auth::Failure::Forbidden
+					&& self.can_read_history(channel)
+					&& self.history_retry < MAX_HISTORY_RETRIES
+				{
+					self.history_retry += 1;
+					self.status = "Message history request was rejected; retrying";
+					self.history_retry_at = Some(Instant::now() + HISTORY_RETRY_DELAY);
+					return;
+				}
 				if failure == auth::Failure::Forbidden {
 					self.clear_search();
 					self.application_commands.clear();
@@ -3679,6 +3782,9 @@ impl State {
 				// The voice socket is independent and a RESUME replays roster changes, so the call,
 				// roster and known DM calls all stay. Only a fresh READY invalidates the voice state.
 				self.voice.incoming = None;
+				// A dropped socket cannot acknowledge the hangup; the departure is over
+				// locally, and a join waiting for it resumes after reconnecting.
+				self.voice.departing = None;
 				if std::mem::replace(&mut self.gateway_connected, false) {
 					self.cancel_history();
 					self.freshness = Freshness::Stale;
@@ -3719,6 +3825,7 @@ impl State {
 				self.timeline.clear();
 				self.freshness = Freshness::Stale;
 				self.cancel_history();
+				self.history_retry = 0;
 				self.status = "";
 				Ok(())
 			}
@@ -3957,6 +4064,7 @@ impl State {
 		self.history_after = None;
 		self.newer_cursor = None;
 		self.newer_may_have_more = false;
+		self.history_retry_at = None;
 		self.timeline.cancel_page();
 	}
 }
@@ -6170,10 +6278,235 @@ mod tests {
 					failure: auth::Failure::Forbidden,
 				},
 			);
+			// The permissions still allow reading, so the rejection retries instead of
+			// revoking the conversation immediately.
+			assert_eq!(state.freshness, Freshness::Loading);
+			assert_eq!(state.history_retry, 1);
+			assert_eq!(
+				state.status,
+				"Message history request was rejected; retrying"
+			);
+			// Once the bounded retries are spent the channel is revoked as before.
+			for _ in 0..MAX_HISTORY_RETRIES {
+				state.history_retry_at = Some(Instant::now() - Duration::from_secs(1));
+				let Some(Command::History { request, .. }) = state.retry_history() else {
+					panic!("rejected read must retry inside its budget");
+				};
+				apply(
+					&mut state,
+					Event::HistoryFailed {
+						channel: Id(1),
+						request,
+						failure: auth::Failure::Forbidden,
+					},
+				);
+			}
 			assert_eq!(state.freshness, Freshness::Unavailable);
 			assert!(state.timeline.is_empty());
+			// An exhausted budget must not re-request on its own.
+			assert!(state.refresh_unavailable_history().is_none());
 			apply(&mut state, Event::Message(message(200)));
 			assert!(state.timeline.is_empty()); // queued live content cannot undo revocation
 		}
+	}
+	#[test]
+	fn a_rejected_read_with_local_permission_retries_then_delivers() {
+		let mut state = State {
+			auth: auth::AuthState::Authenticated,
+			gateway_connected: true,
+			user: Some(User {
+				primary_guild: None,
+				cosmetics: None,
+				id: Id(2),
+				name: "Synthetic".into(),
+				avatar: None,
+				webhook: false,
+				kind: Default::default(),
+				discriminator: 0,
+			}),
+			channels: vec![Channel {
+				last_message: None,
+				id: Id(1),
+				guild: None,
+				parent_id: None,
+				position: 0,
+				name: "Synthetic".into(),
+				kind: 1,
+				recipients: vec![],
+				icon: None,
+				member_list_id: None,
+				tags: None,
+				message_count: None,
+			}],
+			..Default::default()
+		};
+		state.select(Id(1));
+		let request = state.request;
+		assert!(state.history_pending);
+		apply(
+			&mut state,
+			Event::HistoryFailed {
+				channel: Id(1),
+				request,
+				failure: auth::Failure::Forbidden,
+			},
+		);
+		// The DM permissions still allow reading: the rejection is transient, not revocation.
+		assert_eq!(state.freshness, Freshness::Loading);
+		assert_eq!(state.history_retry, 1);
+		assert_eq!(
+			state.status,
+			"Message history request was rejected; retrying"
+		);
+		assert!(state.retry_history().is_none()); // waits for the delay
+		state.history_retry_at = Some(Instant::now() - Duration::from_secs(1));
+		let Some(Command::History {
+			channel,
+			request: retry,
+			..
+		}) = state.retry_history()
+		else {
+			panic!("rejected read must retry inside its budget");
+		};
+		assert_eq!(channel, Id(1));
+		assert_ne!(retry, request);
+		// The retried request delivers; a delivered page refills the budget.
+		apply(
+			&mut state,
+			Event::History {
+				channel: Id(1),
+				request: retry,
+				older: false,
+				messages: vec![message(7)],
+			},
+		);
+		assert_eq!(state.freshness, Freshness::Fresh);
+		assert_eq!(state.timeline.len(), 1);
+		assert_eq!(state.history_retry, 0);
+		assert!(state.history_retry_in().is_none());
+	}
+	#[test]
+	fn a_click_rejected_during_login_sync_opens_when_permissions_arrive() {
+		let mut state = State {
+			auth: auth::AuthState::Authenticated,
+			gateway_connected: true,
+			user: Some(User {
+				primary_guild: None,
+				cosmetics: None,
+				id: Id(2),
+				name: "Synthetic".into(),
+				avatar: None,
+				webhook: false,
+				kind: Default::default(),
+				discriminator: 0,
+			}),
+			guilds: vec![model::Guild {
+				default_message_notifications: None,
+				id: Id(10),
+				name: "Synthetic".into(),
+				icon: None,
+				emojis: None,
+				stickers: None,
+			}],
+			channels: vec![Channel {
+				last_message: None,
+				id: Id(20),
+				guild: Some(Id(10)),
+				parent_id: None,
+				position: 0,
+				name: "Synthetic".into(),
+				kind: 0,
+				recipients: vec![],
+				icon: None,
+				member_list_id: None,
+				tags: None,
+				message_count: None,
+			}],
+			..Default::default()
+		};
+		// The guild's permission data has not arrived: the click is rejected.
+		assert!(state.select(Id(20)).is_none());
+		assert_eq!(
+			state.status,
+			"Channel permissions are unavailable or access was revoked"
+		);
+		assert_eq!(state.permission_blocked, Some(Id(20)));
+		// Nothing opens while the permissions are still unknown.
+		assert!(state.retry_blocked_channel().is_none());
+		// The guild data arrives with the late login synchronization.
+		grant_permissions(&mut state);
+		let Some(Command::History { channel, .. }) = state.retry_blocked_channel() else {
+			panic!("late permissions must open the rejected channel");
+		};
+		assert_eq!(channel, Id(20));
+		assert_eq!(state.selected, Some(Id(20)));
+		assert!(state.permission_blocked.is_none());
+	}
+	#[test]
+	fn restored_permissions_reload_a_conversation_marked_unavailable() {
+		let mut state = State {
+			auth: auth::AuthState::Authenticated,
+			gateway_connected: true,
+			user: Some(User {
+				primary_guild: None,
+				cosmetics: None,
+				id: Id(2),
+				name: "Synthetic".into(),
+				avatar: None,
+				webhook: false,
+				kind: Default::default(),
+				discriminator: 0,
+			}),
+			guilds: vec![model::Guild {
+				default_message_notifications: None,
+				id: Id(10),
+				name: "Synthetic".into(),
+				icon: None,
+				emojis: None,
+				stickers: None,
+			}],
+			channels: vec![Channel {
+				last_message: None,
+				id: Id(20),
+				guild: Some(Id(10)),
+				parent_id: None,
+				position: 0,
+				name: "Synthetic".into(),
+				kind: 0,
+				recipients: vec![],
+				icon: None,
+				member_list_id: None,
+				tags: None,
+				message_count: None,
+			}],
+			..Default::default()
+		};
+		grant_permissions(&mut state);
+		state.select(Id(20));
+		let request = state.request;
+		let mut loaded = message(5);
+		loaded.channel = Id(20);
+		apply(
+			&mut state,
+			Event::History {
+				channel: Id(20),
+				request,
+				older: false,
+				messages: vec![loaded],
+			},
+		);
+		assert_eq!(state.freshness, Freshness::Fresh);
+		// A resync drops every permission decision; the retried load stays unknown.
+		apply(&mut state, Event::Resync);
+		state.history(None);
+		assert_eq!(state.freshness, Freshness::Unavailable);
+		assert!(state.refresh_unavailable_history().is_none());
+		// The decisions return.
+		grant_permissions(&mut state);
+		let Some(Command::History { channel, .. }) = state.refresh_unavailable_history() else {
+			panic!("restored permissions must reload the conversation");
+		};
+		assert_eq!(channel, Id(20));
+		assert!(state.history_pending);
 	}
 }

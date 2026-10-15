@@ -4256,6 +4256,26 @@ impl Desktop {
 			self.command(command);
 		}
 	}
+	/// Drives the bounded re-request of a history read Discord rejected while local
+	/// permissions still allowed it, of a conversation whose permissions arrived late,
+	/// and of a call join the user requested while the previous call was still leaving.
+	fn poll_history_recovery(&mut self, ctx: &egui::Context) {
+		if let Some(delay) = self.state.history_retry_in() {
+			ctx.request_repaint_after(delay.max(Duration::from_millis(16)));
+		}
+		if let Some(command) = self.state.retry_history() {
+			self.command(command);
+		}
+		if let Some(command) = self.state.refresh_unavailable_history() {
+			self.command(command);
+		}
+		if let Some(command) = self.state.retry_blocked_channel() {
+			self.command(command);
+		}
+		if let Some(command) = self.state.resume_pending_join() {
+			self.command(command);
+		}
+	}
 	fn poll(&mut self, ctx: &egui::Context) {
 		let mut cached = Vec::new();
 		let mut presence_cache_stopped = false;
@@ -5321,6 +5341,7 @@ impl eframe::App for Desktop {
 			&& (self.messaging.push_to_mute_down(ctx) || self.hotkeys.push_to_mute_down());
 		if self.state.auth == AuthState::Authenticated || self.state.demo {
 			self.poll_voice(ctx);
+			self.poll_history_recovery(ctx);
 		} else {
 			self.voice.stop();
 		}

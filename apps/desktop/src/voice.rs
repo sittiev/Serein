@@ -2264,7 +2264,12 @@ mod tests {
 			}))
 		));
 		assert!(manager.pending.is_none());
+		let leaving = state.voice.active.as_ref().unwrap().request;
 		state.leave_call();
+		state.apply_voice(voice::Event::Departed {
+			channel: Id(25),
+			request: leaving,
+		});
 		state.start_call(Id(25), false).unwrap();
 		manager.begin(&state, false).unwrap();
 		state.generation += 1;

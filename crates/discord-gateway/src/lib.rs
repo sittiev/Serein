@@ -1445,7 +1445,7 @@ async fn run_recoverable(
 						Ok(packet)=>packet,
 						Err(_) => {
 							match command {
-								client_core::voice::Command::Join{channel,request,..} => emit(Event::Voice(client_core::voice::Event::Failed{channel,request,message:"Previous call is still leaving, or the channel is unavailable; wait for departure or reconnect"}))?,
+								client_core::voice::Command::Join{channel,request,..} => emit(Event::Voice(client_core::voice::Event::Failed{channel,request,message:calls.join_rejection()}))?,
 								client_core::voice::Command::StartStream{channel,request,stream_request} => emit(Event::Voice(client_core::voice::Event::Stream{channel,request,stream_request,event:client_core::screen::Event::Failed("A screen share is already active, stopping, or the call is unavailable")}))?,
 								client_core::voice::Command::WatchStream{channel,request,stream_request,streamer} => emit(Event::Voice(client_core::voice::Event::Watch{channel,request,stream_request,streamer,event:client_core::screen::Event::Failed("Another stream is already being watched, or the call is unavailable")}))?,
 								_=>{}
@@ -1454,7 +1454,9 @@ async fn run_recoverable(
 						}
 					};
 					if let client_core::voice::Command::Leave { channel, request } | client_core::voice::Command::AbandonSession { channel, request } = command
-						&& packet.is_none() && !calls.has_call() {
+						&& (packet.is_none() || !calls.has_call()) {
+						// A leave that sent its packet but released the call locally (a join
+						// the service never admitted) still completes the departure now.
 						emit(Event::Voice(client_core::voice::Event::Departed { channel, request }))?;
 					}
 					if let Some(channel)=connect && let Some(packet)=calls.packet(client_core::voice::Command::Sync { channel })?

@@ -152,6 +152,13 @@ pub struct State {
 	pub active: Option<Call>,
 	/// Last released local request: service departure or local-only abandonment.
 	pub departed: Option<(Id, u64)>,
+	/// A leave whose service departure has not completed yet.
+	#[doc(hidden)]
+	pub departing: Option<(Id, u64)>,
+	/// A join the user requested while the previous call was leaving; issued once the
+	/// departure completes instead of failing against the pending hangup.
+	#[doc(hidden)]
+	pub pending_join: Option<(Id, bool, bool, bool)>,
 	pub incoming: Option<Id>,
 	/// One explicit outgoing attempt, confirmed only by service ringing recipients.
 	outgoing: Option<(Id, u64, bool)>,
@@ -539,6 +546,14 @@ impl ClientState {
 		}
 		let guild = self.channel(channel)?.guild;
 		let ring = ring && guild.is_none() && !self.voice.has_dm_call(channel);
+		if self.voice.departing.is_some() {
+			// The service departure of the previous call is still pending: wait for it
+			// instead of a Join the service would reject while the hangup is unacknowledged.
+			self.voice.pending_join = Some((channel, ring, muted, deafened));
+			self.status =
+				"Waiting for the previous call to finish leaving; this call starts automatically";
+			return None;
+		}
 		let participants: Vec<_> = if guild.is_some() {
 			self.voice
 				.roster
@@ -629,11 +644,28 @@ impl ClientState {
 			deaf: call.deafened,
 		}))
 	}
+	/// The join requested while the previous call was leaving; issued once the departure
+	/// completes. `None` while the departure is pending, or once the request was served.
+	pub fn resume_pending_join(&mut self) -> Option<crate::Command> {
+		if self.voice.departing.is_some() {
+			return None;
+		}
+		let (channel, ring, muted, deafened) = self.voice.pending_join?;
+		// Keep the request parked while this device cannot call yet; only a produced
+		// join consumes it.
+		let command = self.start_call_with_mute(channel, ring, muted, deafened)?;
+		self.voice.pending_join = None;
+		self.status = "";
+		Some(command)
+	}
 	pub fn leave_call(&mut self) -> Option<crate::Command> {
 		self.voice.outgoing = None;
 		let call = self.voice.active.take()?;
 		self.voice.ring_error = None;
 		self.voice.departed = None;
+		self.voice.departing = Some((call.channel, call.request));
+		// An explicit leave cancels a join that was waiting for this departure.
+		self.voice.pending_join = None;
 		Some(crate::Command::Voice(Command::Leave {
 			channel: call.channel,
 			request: call.request,
@@ -763,6 +795,13 @@ impl ClientState {
 				}
 			}
 			Event::Departed { channel, request } => {
+				if self
+					.voice
+					.departing
+					.is_some_and(|(left, left_request)| left == channel && left_request == request)
+				{
+					self.voice.departing = None;
+				}
 				self.voice.departed = Some((channel, request));
 			}
 			Event::Snapshot {
@@ -1063,6 +1102,11 @@ impl ClientState {
 				if request == 0 || self.voice.active.is_none() {
 					self.status = message;
 				}
+				// An unacknowledged departure still ends locally, so a join the user
+				// requested meanwhile can start.
+				if self.voice.active.is_none() && self.voice.departing == Some((channel, request)) {
+					self.voice.departing = None;
+				}
 				if let Some(call) = &mut self.voice.active
 					&& call.channel == channel
 					&& call.request == request
@@ -1159,6 +1203,13 @@ impl ClientState {
 		if self.voice.outgoing.is_some_and(|(id, _, _)| id == channel) {
 			self.voice.outgoing = None;
 		}
+		if self
+			.voice
+			.pending_join
+			.is_some_and(|(id, _, _, _)| id == channel)
+		{
+			self.voice.pending_join = None;
+		}
 		self.voice.dm_calls.retain(|id| *id != channel);
 		if self
 			.voice
@@ -1192,6 +1243,7 @@ impl ClientState {
 	}
 	pub fn disconnect_voice(&mut self, reason: &'static str) {
 		self.voice.outgoing = None;
+		self.voice.pending_join = None;
 		self.voice.dm_calls.clear();
 		self.voice.dm_participants.clear();
 		self.voice.dm_ringing.clear();
@@ -1621,6 +1673,10 @@ mod tests {
 					.collect(),
 			});
 			state.leave_call();
+			state.apply_voice(Event::Departed {
+				channel: Id(20),
+				request,
+			});
 			state.gateway_connected = true;
 			assert!(state.start_call(Id(20), false).is_none());
 			state.apply(Envelope {
@@ -2092,6 +2148,10 @@ mod tests {
 			});
 			assert_eq!(state.voice.active.as_ref().unwrap().phase, Phase::Connected);
 			assert!(state.leave_call().is_some());
+			state.apply_voice(Event::Departed {
+				channel: Id(2),
+				request,
+			});
 			state.gateway_connected = true;
 			state.channels[0].kind = 13;
 			assert!(state.start_call(Id(2), true).is_none());
@@ -2112,7 +2172,13 @@ mod tests {
 					.unwrap()
 					.contains("queue")
 			);
+			// The service acknowledges the hangup of the failed attempt.
+			let leaving = state.voice.active.as_ref().unwrap().request;
 			state.leave_call();
+			state.apply_voice(Event::Departed {
+				channel: Id(2),
+				request: leaving,
+			});
 			let command = state
 				.start_call_with_mute(Id(2), false, true, true)
 				.unwrap();
@@ -2232,7 +2298,12 @@ mod tests {
 			assert!(call.participants.is_empty());
 			assert_ne!(call.phase, Phase::Failed);
 			// Their state while this device is not in the call still updates the known membership.
+			let leaving = state.voice.active.as_ref().unwrap().request;
 			assert!(state.leave_call().is_some());
+			state.apply_voice(Event::Departed {
+				channel: Id(2),
+				request: leaving,
+			});
 			state.apply_voice(Event::State {
 				request: None,
 				guild: None,
@@ -2291,6 +2362,11 @@ mod tests {
 				"ended ringing cannot restart itself"
 			);
 			state.leave_call();
+			// The service acknowledges the hangup before the channel is deleted.
+			state.apply_voice(Event::Departed {
+				channel: Id(2),
+				request: first,
+			});
 			state.apply_voice(Event::Deleted { channel: Id(2) });
 			state.start_call(Id(2), true).unwrap();
 			service_ring(&mut state, &[Id(3)]);
@@ -2305,7 +2381,12 @@ mod tests {
 				"stale failure cannot stop a new attempt"
 			);
 			for ring in [false, true] {
+				let leaving = state.voice.active.as_ref().unwrap().request;
 				state.leave_call();
+				state.apply_voice(Event::Departed {
+					channel: Id(2),
+					request: leaving,
+				});
 				state.start_call(Id(2), ring).unwrap(); // An existing service call is a join.
 				service_ring(&mut state, &[Id(3)]);
 				let request = state.voice.active.as_ref().unwrap().request;
@@ -2396,5 +2477,167 @@ mod tests {
 				assert_eq!(state.outgoing_ring(), None, "{end} must consume the intent");
 			}
 		}
+	}
+
+	fn two_voice_rooms() -> ClientState {
+		use model::permissions as p;
+		let mut state = ClientState {
+			auth: AuthState::Authenticated,
+			gateway_connected: true,
+			user: Some(User {
+				primary_guild: None,
+				cosmetics: None,
+				id: Id(1),
+				name: "Synthetic".into(),
+				avatar: None,
+				webhook: false,
+				kind: Default::default(),
+				discriminator: 0,
+			}),
+			guilds: vec![model::Guild {
+				default_message_notifications: None,
+				id: Id(10),
+				name: "Synthetic".into(),
+				icon: None,
+				emojis: None,
+				stickers: None,
+			}],
+			channels: [20, 21]
+				.into_iter()
+				.map(|id| Channel {
+					last_message: None,
+					id: Id(id),
+					guild: Some(Id(10)),
+					parent_id: None,
+					position: 0,
+					name: "Room".into(),
+					kind: 2,
+					recipients: vec![],
+					icon: None,
+					member_list_id: None,
+					tags: None,
+					message_count: None,
+				})
+				.collect(),
+			..Default::default()
+		};
+		state
+			.permissions
+			.replace(p::Snapshot {
+				guilds: vec![p::Guild {
+					id: Id(10),
+					owner: Some(Id(99)),
+					roles: Some(vec![p::Role {
+						id: Id(10),
+						name: String::new(),
+						color: 0,
+						secondary_color: None,
+						tertiary_color: None,
+						position: 0,
+						hoist: false,
+						bits: p::VIEW_CHANNEL | p::CONNECT,
+					}]),
+					member: Some(p::Member {
+						roles: vec![],
+						timeout_until: None,
+					}),
+				}],
+				channels: [20, 21]
+					.into_iter()
+					.map(|id| p::Channel {
+						id: Id(id),
+						guild: Id(10),
+						overwrites: Some(vec![]),
+					})
+					.collect(),
+			})
+			.unwrap();
+		state
+	}
+
+	#[test]
+	fn a_join_requested_while_leaving_starts_when_the_departure_completes() {
+		let mut state = two_voice_rooms();
+		state.start_call(Id(20), false).unwrap();
+		let leaving = state.voice.active.as_ref().unwrap().request;
+		state.leave_call();
+		assert_eq!(state.voice.departing, Some((Id(20), leaving)));
+		// Clicking Join on the other room waits for the departure instead of failing.
+		assert!(state.start_call(Id(21), false).is_none());
+		assert_eq!(
+			state.voice.pending_join,
+			Some((Id(21), false, false, false))
+		);
+		assert!(
+			state
+				.status
+				.contains("Waiting for the previous call to finish leaving")
+		);
+		assert!(state.resume_pending_join().is_none()); // departure still pending
+		state.apply_voice(Event::Departed {
+			channel: Id(20),
+			request: leaving,
+		});
+		assert!(state.voice.departing.is_none());
+		let Some(crate::Command::Voice(Command::Join {
+			channel,
+			request: joined,
+			..
+		})) = state.resume_pending_join()
+		else {
+			panic!("the waiting join must start once the departure completes");
+		};
+		assert_eq!(channel, Id(21));
+		assert_ne!(joined, leaving);
+		assert_eq!(
+			state.voice.active.as_ref().map(|call| call.channel),
+			Some(Id(21))
+		);
+		// A served request does not fire twice.
+		assert!(state.resume_pending_join().is_none());
+	}
+
+	#[test]
+	fn an_unacknowledged_departure_still_starts_the_requested_join() {
+		let mut state = two_voice_rooms();
+		state.start_call(Id(20), false).unwrap();
+		let leaving = state.voice.active.as_ref().unwrap().request;
+		state.leave_call();
+		state.start_call(Id(21), false); // deferred behind the pending departure
+		assert!(state.voice.pending_join.is_some());
+		// The service never acknowledged the hangup; the local release still ends it.
+		state.apply_voice(Event::Failed {
+			channel: Id(20),
+			request: leaving,
+			message: "Discord did not acknowledge hangup; the call was left locally",
+		});
+		assert!(state.voice.departing.is_none());
+		let Some(crate::Command::Voice(Command::Join { channel, .. })) =
+			state.resume_pending_join()
+		else {
+			panic!("an unacknowledged departure must not block the requested join");
+		};
+		assert_eq!(channel, Id(21));
+	}
+
+	#[test]
+	fn a_dropped_gateway_clears_the_pending_departure() {
+		let mut state = two_voice_rooms();
+		state.start_call(Id(20), false).unwrap();
+		state.leave_call();
+		assert!(state.voice.departing.is_some());
+		state.apply(Envelope {
+			generation: state.generation,
+			event: CoreEvent::Disconnected,
+		});
+		assert!(state.voice.departing.is_none());
+		// The departure is over locally, so a later join no longer waits for it.
+		state.gateway_connected = true;
+		let Some(crate::Command::Voice(Command::Join { channel, .. })) =
+			state.start_call(Id(21), false)
+		else {
+			panic!("a cleared departure must not block the join");
+		};
+		assert_eq!(channel, Id(21));
 	}
 }
